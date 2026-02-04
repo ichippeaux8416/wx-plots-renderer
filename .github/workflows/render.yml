@@ -1,0 +1,53 @@
+name: Render HRRR plots
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run every hour (UTC). Efficient + reliable.
+    - cron: "7 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wx-plots-renderer
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Render + upload to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
+        run: |
+          python -V
+          ls -la
+          # Try common entrypoints, in this order:
+          if [ -f render.py ]; then
+            python render.py
+          elif [ -f main.py ]; then
+            python main.py
+          elif [ -f app.py ]; then
+            python app.py
+          else
+            echo "No render.py / main.py / app.py found. Add one of those files as your entrypoint."
+            exit 1
+          fi
