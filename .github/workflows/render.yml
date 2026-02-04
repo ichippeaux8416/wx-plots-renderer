@@ -3,13 +3,7 @@ name: Render HRRR plots
 on:
   workflow_dispatch:
   schedule:
-    # Every 20 minutes (UTC). Your script can exit fast if nothing new is available.
     - cron: "*/20 * * * *"
-  push:
-    paths:
-      - "render.py"
-      - "requirements.txt"
-      - ".github/workflows/render.yml"
 
 concurrency:
   group: hrrr-render
@@ -18,7 +12,7 @@ concurrency:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -30,7 +24,12 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install deps
+      - name: Install system deps (eccodes)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes0
+
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
