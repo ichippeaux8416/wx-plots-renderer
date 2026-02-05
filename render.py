@@ -1,380 +1,494 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
-import io
-import json
-import math
 import os
-import sys
+import json
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote
+import math
+import shutil
+import tempfile
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple, List
 
-import numpy as np
 import requests
-import xarray as xr
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 
-# -----------------------
-# Settings
-# -----------------------
+import xarray as xr
 
-IEM_BASE = "https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr"
-IEM_META = f"{IEM_BASE}/refd_1080.json"  # contains model_init_utc often
-
-NOMADS_BASE = "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl"
-
-DEFAULT_DOMAIN = "conus"
-DEFAULT_MAX_FH = 18
-
-# quick CONUS-ish extent (for imshow)
-EXTENT = (-130.0, -65.0, 22.0, 52.0)  # (lonW, lonE, latS, latN)
-
-MS_TO_KT = 1.9438444924406048
-
-@dataclass
-class Settings:
-    supabase_url: str
-    supabase_key: str
-    bucket: str
-    domain: str
-    max_fh: int
+from supabase import create_client
 
 
-def die(msg: str, code: int = 1):
-    print(msg, file=sys.stderr)
-    sys.exit(code)
+# -----------------------------
+# Config (env)
+# -----------------------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "wx-plots").strip()
+
+# How many forecast hours we render per run (keep small at first; raise later)
+HRRR_MAX_FHR = int(os.environ.get("HRRR_MAX_FHR", "18"))   # 0..18 step 1
+GFS_MAX_FHR  = int(os.environ.get("GFS_MAX_FHR", "48"))    # 0..48 step 3
+
+# Networking
+UA = "wx-plots-renderer/1.0 (+github actions)"
+TIMEOUT = 30
 
 
-def env_required(name: str) -> str:
+# -----------------------------
+# Utility
+# -----------------------------
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+def must_env(name: str) -> str:
     v = os.environ.get(name, "").strip()
     if not v:
-        die(f"Missing required env var: {name}")
+        raise SystemExit(f"Missing required env var: {name}")
     return v
 
+def http_head_ok(url: str) -> bool:
+    try:
+        r = requests.head(url, timeout=TIMEOUT, headers={"User-Agent": UA})
+        return r.status_code == 200
+    except Exception:
+        return False
 
-def load_settings() -> Settings:
-    return Settings(
-        supabase_url=env_required("SUPABASE_URL").rstrip("/"),
-        supabase_key=env_required("SUPABASE_SERVICE_ROLE_KEY"),
-        bucket=os.environ.get("SUPABASE_BUCKET", "wx-plots").strip() or "wx-plots",
-        domain=os.environ.get("HRRR_DOMAIN", DEFAULT_DOMAIN).strip() or DEFAULT_DOMAIN,
-        max_fh=int(os.environ.get("MAX_FH", str(DEFAULT_MAX_FH))),
+def http_get_stream(url: str, out_path: str) -> None:
+    with requests.get(url, stream=True, timeout=TIMEOUT, headers={"User-Agent": UA}) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+
+# -----------------------------
+# NOMADS URL builders
+# -----------------------------
+def hrrr_url(run_dt: datetime, cycle: int, fhr: int, domain: str = "conus") -> str:
+    """
+    HRRR surface file (wrfsfc) from NOMADS.
+    Example:
+      https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/hrrr.YYYYMMDD/conus/hrrr.tHHz.wrfsfcfFFF.grib2
+    """
+    ymd = run_dt.strftime("%Y%m%d")
+    hh = f"{cycle:02d}"
+    fff = f"{fhr:02d}" if fhr < 100 else f"{fhr:03d}"
+    return f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/hrrr.{ymd}/{domain}/hrrr.t{hh}z.wrfsfcf{fff}.grib2"
+
+def gfs_url(run_dt: datetime, cycle: int, fhr: int, res: str = "0p25") -> str:
+    """
+    GFS pgrb2 file from NOMADS.
+    Example:
+      https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.YYYYMMDD/HH/atmos/gfs.tHHz.pgrb2.0p25.fFFF
+    """
+    ymd = run_dt.strftime("%Y%m%d")
+    hh = f"{cycle:02d}"
+    fff = f"{fhr:03d}"
+    return f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{ymd}/{hh}/atmos/gfs.t{hh}z.pgrb2.{res}.f{fff}"
+
+
+# -----------------------------
+# Cycle resolution (latest available)
+# -----------------------------
+def find_latest_hrrr_cycle(domain: str = "conus") -> Tuple[datetime, int]:
+    """
+    Try recent dates/cycles and pick the newest cycle that has f00 available.
+    """
+    now = datetime.now(timezone.utc)
+    # HRRR cycles hourly; try last 30 hours
+    for back_h in range(0, 30):
+        candidate = now - timedelta(hours=back_h)
+        run_dt = candidate.replace(minute=0, second=0, microsecond=0)
+        cyc = run_dt.hour
+        url = hrrr_url(run_dt, cyc, 0, domain=domain)
+        if http_head_ok(url):
+            return (run_dt, cyc)
+    raise RuntimeError("Could not find an available HRRR cycle on NOMADS in last 30 hours.")
+
+def find_latest_gfs_cycle() -> Tuple[datetime, int]:
+    """
+    GFS cycles 00/06/12/18; try last ~2 days.
+    """
+    now = datetime.now(timezone.utc)
+    cycles = [18, 12, 6, 0]
+    for back_d in range(0, 3):
+        day = (now - timedelta(days=back_d)).replace(hour=0, minute=0, second=0, microsecond=0)
+        # pick likely latest first based on current time
+        for cyc in cycles:
+            # only consider cycles that are not "in the future" for today
+            candidate_dt = day.replace(hour=cyc)
+            if candidate_dt > now + timedelta(hours=1):
+                continue
+            url = gfs_url(candidate_dt, cyc, 0)
+            if http_head_ok(url):
+                return (candidate_dt, cyc)
+    raise RuntimeError("Could not find an available GFS cycle on NOMADS in last 3 days.")
+
+
+# -----------------------------
+# GRIB reading
+# -----------------------------
+def open_grib_field(
+    grib_path: str,
+    short_name: str,
+    type_of_level: str,
+    level: int,
+) -> xr.Dataset:
+    """
+    Open a GRIB2 dataset filtered by keys.
+    """
+    # cfgrib filter keys: shortName, typeOfLevel, level
+    ds = xr.open_dataset(
+        grib_path,
+        engine="cfgrib",
+        backend_kwargs={
+            "filter_by_keys": {
+                "shortName": short_name,
+                "typeOfLevel": type_of_level,
+                "level": int(level),
+            }
+        },
     )
-
-
-def http_get_bytes(url: str, timeout=(10, 60), retries: int = 3) -> bytes:
-    headers = {
-        "User-Agent": "wx-plots-renderer/2.0 (GitHub Actions)",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    last = None
-    for a in range(1, retries + 1):
-        try:
-            r = requests.get(url, headers=headers, timeout=timeout)
-            if r.status_code == 200 and r.content:
-                return r.content
-            last = RuntimeError(f"HTTP {r.status_code} for {url}")
-        except Exception as e:
-            last = e
-        time.sleep(0.7 * a)
-    raise RuntimeError(f"Fetch failed after {retries} tries: {last}")
-
-
-def parse_iso_z(s: str) -> datetime:
-    s = s.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s).astimezone(timezone.utc)
-
-
-def get_hrrr_init_stamp() -> Tuple[str, str]:
-    """
-    Returns (init_iso_utc, init_stamp_YYYYMMDDHH)
-    """
-    meta = json.loads(http_get_bytes(IEM_META).decode("utf-8"))
-    init_iso = meta.get("model_init_utc") or meta.get("init_utc") or ""
-    if init_iso:
-        dt = parse_iso_z(init_iso)
-    else:
-        dt = datetime.now(timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), dt.strftime("%Y%m%d%H")
-
-
-# -----------------------
-# Supabase upload (REST)
-# -----------------------
-
-def supabase_upload_bytes(settings: Settings, remote_path: str, data: bytes, content_type: str):
-    remote_path = remote_path.lstrip("/")
-    url = f"{settings.supabase_url}/storage/v1/object/{settings.bucket}/{quote(remote_path)}"
-    headers = {
-        "Authorization": f"Bearer {settings.supabase_key}",
-        "apikey": settings.supabase_key,
-        "x-upsert": "true",
-        "Content-Type": content_type,
-    }
-    r = requests.post(url, headers=headers, data=data, timeout=(10, 60))
-    if r.status_code in (200, 201):
-        return
-    r2 = requests.put(url, headers=headers, data=data, timeout=(10, 60))
-    if r2.status_code in (200, 201):
-        return
-    raise RuntimeError(f"Supabase upload failed {remote_path} (POST {r.status_code}, PUT {r2.status_code}) "
-                       f"POST: {r.text[:250]} PUT: {r2.text[:250]}")
-
-
-# -----------------------
-# IEM SimRef (REFD) fetch
-# -----------------------
-
-def iem_refd_url(fh: int) -> str:
-    minutes = fh * 60
-    return f"{IEM_BASE}/refd_{minutes:04d}.png"
-
-
-# -----------------------
-# NOMADS HRRR GRIB fetch (subset)
-# -----------------------
-
-def nomads_url_wrfsfc(init_stamp: str, fh: int, want_cape=True, want_10m=True) -> str:
-    """
-    wrfsfc file: hrrr.tHHz.wrfsfcfFF.grib2
-    """
-    ymd = init_stamp[:8]
-    hh = init_stamp[8:10]
-    ff = f"{fh:02d}"
-
-    params = []
-    if want_cape:
-        params += ["var_CAPE=on"]
-    if want_10m:
-        params += ["var_UGRD=on", "var_VGRD=on", "lev_10_m_above_ground=on"]
-
-    qs = "&".join(params)
-    return (f"{NOMADS_BASE}?file=hrrr.t{hh}z.wrfsfcf{ff}.grib2"
-            f"&dir=%2Fhrrr.{ymd}%2Fconus&{qs}")
-
-
-def nomads_url_wrfprs(init_stamp: str, fh: int) -> str:
-    """
-    wrfprs file: hrrr.tHHz.wrfprsfFF.grib2  (pressure levels)
-    """
-    ymd = init_stamp[:8]
-    hh = init_stamp[8:10]
-    ff = f"{fh:02d}"
-    # request only U/V at 850 mb
-    qs = "var_UGRD=on&var_VGRD=on&lev_850_mb=on"
-    return (f"{NOMADS_BASE}?file=hrrr.t{hh}z.wrfprsf{ff}.grib2"
-            f"&dir=%2Fhrrr.{ymd}%2Fconus&{qs}")
-
-
-def open_grib_bytes(grib_bytes: bytes) -> xr.Dataset:
-    """
-    Read GRIB2 bytes with cfgrib via a temp in-memory file approach.
-    """
-    # cfgrib needs a real file-like path; write to temp file in /tmp
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".grib2", delete=True) as f:
-        f.write(grib_bytes)
-        f.flush()
-        ds = xr.open_dataset(f.name, engine="cfgrib")
     return ds
 
 
-def get_latlon(ds: xr.Dataset) -> Tuple[np.ndarray, np.ndarray]:
-    # cfgrib usually provides latitude/longitude variables
-    if "latitude" in ds and "longitude" in ds:
-        lat = ds["latitude"].values
-        lon = ds["longitude"].values
-        # sometimes lon is 0..360
-        lon = np.where(lon > 180, lon - 360, lon)
+def pick_data_var(ds: xr.Dataset) -> xr.DataArray:
+    # Pick first non-coordinate variable.
+    for v in ds.data_vars:
+        return ds[v]
+    raise RuntimeError("No data variables found in dataset.")
+
+
+def get_latlon(da: xr.DataArray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns lat, lon as 2D arrays.
+    cfgrib typically provides latitude/longitude as 2D coords.
+    """
+    if "latitude" in da.coords and "longitude" in da.coords:
+        lat = da["latitude"].values
+        lon = da["longitude"].values
         return lat, lon
-    # fallback: coords might be named "lat" / "lon"
-    for a, b in [("lat", "lon"), ("latitude", "longitude")]:
-        if a in ds.coords and b in ds.coords:
-            lat = ds.coords[a].values
-            lon = ds.coords[b].values
-            lon = np.where(lon > 180, lon - 360, lon)
-            return lat, lon
-    raise RuntimeError("Could not find lat/lon in dataset")
+    # sometimes on dataset
+    if "latitude" in da.to_dataset(name="x").coords and "longitude" in da.to_dataset(name="x").coords:
+        lat = da.to_dataset(name="x")["latitude"].values
+        lon = da.to_dataset(name="x")["longitude"].values
+        return lat, lon
+    raise RuntimeError("Could not locate latitude/longitude coordinates in GRIB dataset.")
 
 
-# -----------------------
+# -----------------------------
 # Plotting
-# -----------------------
+# -----------------------------
+def conus_extent():
+    # (lon_min, lon_max, lat_min, lat_max)
+    return (-126.0, -66.0, 22.0, 50.5)
 
-def save_field_png(field: np.ndarray, lat: np.ndarray, lon: np.ndarray,
-                   title: str, out_w: int = 1200, out_h: int = 720) -> bytes:
-    """
-    Very fast "Tidbits-like" static plot: imshow with extent. No Cartopy to keep Actions light.
-    """
-    lonW, lonE, latS, latN = EXTENT
+def make_axes(domain: str, model: str):
+    if model == "gfs":
+        proj = ccrs.Robinson()
+        ax = plt.axes(projection=proj)
+        ax.set_global()
+        return ax, proj
+    # HRRR CONUS
+    proj = ccrs.LambertConformal(central_longitude=-97.0, central_latitude=38.0)
+    ax = plt.axes(projection=proj)
+    ax.set_extent(conus_extent(), crs=ccrs.PlateCarree())
+    return ax, proj
 
-    # mask outside extent (keeps plot clean)
-    mask = (lon < lonW) | (lon > lonE) | (lat < latS) | (lat > latN)
-    plot = np.array(field, dtype=np.float32)
-    plot = np.where(mask, np.nan, plot)
+def add_map_features(ax):
+    ax.add_feature(cfeature.COASTLINE.with_scale("50m"), linewidth=0.6)
+    ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.5)
+    try:
+        ax.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.35)
+    except Exception:
+        pass
 
-    fig = plt.figure(figsize=(out_w/100, out_h/100), dpi=100)
-    ax = plt.gca()
-    ax.set_facecolor("#101010")
+def render_pcolormesh(
+    out_png: str,
+    da: xr.DataArray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    title: str,
+    units: str,
+    cmap: str = "turbo",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    model: str = "hrrr",
+    domain: str = "conus",
+):
+    plt.figure(figsize=(12.8, 7.2), dpi=120)
+    ax, _ = make_axes(domain=domain, model=model)
+    add_map_features(ax)
 
-    # imshow needs regular grid; HRRR is near-regular on lat/lon arrays here
-    # We plot by extent; distortion is acceptable for MVP.
-    im = ax.imshow(plot, origin="upper",
-                   extent=(lon.min(), lon.max(), lat.min(), lat.max()),
-                   aspect="auto")
+    # Normalize lon to [-180,180] for global plotting sanity
+    lon_plot = lon.copy()
+    if lon_plot.max() > 180:
+        lon_plot = ((lon_plot + 180) % 360) - 180
 
-    ax.set_xlim(lonW, lonE)
-    ax.set_ylim(latS, latN)
-    ax.set_title(title, color="white", fontsize=14, pad=10)
-    ax.tick_params(colors="#cfcfcf", labelsize=9)
-    ax.grid(color="white", alpha=0.08, linewidth=0.8)
+    mesh = ax.pcolormesh(
+        lon_plot,
+        lat,
+        da.values,
+        transform=ccrs.PlateCarree(),
+        cmap=cmap,
+        shading="auto",
+        vmin=vmin,
+        vmax=vmax,
+    )
+    cb = plt.colorbar(mesh, ax=ax, orientation="horizontal", pad=0.03, fraction=0.045)
+    cb.set_label(units)
 
-    cbar = plt.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
-    cbar.ax.tick_params(labelsize=9, colors="#cfcfcf")
-
-    buf = io.BytesIO()
+    plt.title(title, fontsize=12, pad=10)
     plt.tight_layout()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
+    plt.savefig(out_png, bbox_inches="tight")
+    plt.close()
 
 
-# -----------------------
-# Main render
-# -----------------------
+def render_contours_mslp(
+    out_png: str,
+    da: xr.DataArray,
+    lat: np.ndarray,
+    lon: np.ndarray,
+    title: str,
+    levels_hpa: List[int],
+    model: str = "gfs",
+    domain: str = "global",
+):
+    plt.figure(figsize=(12.8, 7.2), dpi=120)
+    ax, _ = make_axes(domain=domain, model=model)
+    add_map_features(ax)
 
+    lon_plot = lon.copy()
+    if lon_plot.max() > 180:
+        lon_plot = ((lon_plot + 180) % 360) - 180
+
+    # Convert Pa -> hPa if needed
+    vals = da.values
+    if np.nanmean(vals) > 20000:
+        vals = vals / 100.0
+
+    cs = ax.contour(
+        lon_plot,
+        lat,
+        vals,
+        levels=levels_hpa,
+        colors="black",
+        linewidths=0.7,
+        transform=ccrs.PlateCarree(),
+    )
+    ax.clabel(cs, inline=True, fontsize=7, fmt="%d")
+
+    plt.title(title, fontsize=12, pad=10)
+    plt.tight_layout()
+    plt.savefig(out_png, bbox_inches="tight")
+    plt.close()
+
+
+# -----------------------------
+# Supabase upload
+# -----------------------------
+def supabase_client():
+    url = must_env("SUPABASE_URL")
+    key = must_env("SUPABASE_SERVICE_ROLE_KEY")
+    return create_client(url, key)
+
+def upload_file(sb, bucket: str, object_path: str, file_path: str, content_type: str = "image/png"):
+    with open(file_path, "rb") as f:
+        data = f.read()
+    # upsert=True overwrites existing objects at the same path
+    res = sb.storage.from_(bucket).upload(
+        path=object_path,
+        file=data,
+        file_options={"content-type": content_type, "upsert": "true"},
+    )
+    return res
+
+
+# -----------------------------
+# Recipes (v1)
+# -----------------------------
+def run_recipe_field(model: str, grib_path: str, item: Dict[str, Any]) -> Tuple[xr.DataArray, np.ndarray, np.ndarray]:
+    g = item["grib"]
+    ds = open_grib_field(
+        grib_path=grib_path,
+        short_name=g["shortName"],
+        type_of_level=g["typeOfLevel"],
+        level=int(g["level"]),
+    )
+    da = pick_data_var(ds)
+    lat, lon = get_latlon(da)
+    return da, lat, lon
+
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
-    settings = load_settings()
-    init_iso, init_stamp = get_hrrr_init_stamp()
+    # Load registry
+    with open("products.json", "r", encoding="utf-8") as f:
+        registry = json.load(f)
 
-    latest_prefix = f"hrrr/{settings.domain}/latest"
-    run_prefix = f"hrrr/{settings.domain}/runs/{init_stamp}"
+    sb = None
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        sb = supabase_client()
+        log(f"Supabase configured. Bucket={SUPABASE_BUCKET}")
+    else:
+        log("Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing). Will render locally only.")
 
-    manifest: Dict = {
-        "model": "hrrr",
-        "domain": settings.domain,
-        "init_utc": init_iso,
-        "init_stamp": init_stamp,
-        "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "products": {},
-    }
+    tmp = tempfile.mkdtemp(prefix="wxplots_")
+    log(f"Working dir: {tmp}")
 
-    hours = list(range(0, settings.max_fh + 1))
-    manifest["forecast_hours"] = hours
+    try:
+        # --- HRRR
+        if "hrrr" in registry["models"]:
+            run_dt, cyc = find_latest_hrrr_cycle(domain="conus")
+            log(f"HRRR latest cycle: {run_dt:%Y-%m-%d} {cyc:02d}Z")
 
-    # ---- 1) SimRef from IEM (REFD)
-    simref_ok = []
-    for fh in hours:
-        try:
-            png = http_get_bytes(iem_refd_url(fh))
-            name = f"simref_f{fh:03d}.png"
-            supabase_upload_bytes(settings, f"{latest_prefix}/{name}", png, "image/png")
-            supabase_upload_bytes(settings, f"{run_prefix}/{name}", png, "image/png")
-            simref_ok.append(fh)
-            time.sleep(0.12)
-        except Exception as e:
-            print(f"[simref] fh{fh:03d} failed: {e}", file=sys.stderr)
+            hrrr_model = registry["models"]["hrrr"]
+            domain_cfg = hrrr_model["domains"]["conus"]
 
-    manifest["products"]["simref"] = {"ok_hours": simref_ok, "source": "IEM REFD PNG"}
+            max_fhr = min(HRRR_MAX_FHR, int(domain_cfg["fhr_range"]["end"]))
+            fhrs = list(range(0, max_fhr + 1, int(domain_cfg["fhr_range"]["step"])))
 
-    # ---- 2) CAPE + 0–850 bulk shear from NOMADS HRRR GRIB
-    cape_ok, shear_ok = [], []
+            for group_key, group in hrrr_model["products"].items():
+                for item in group["items"]:
+                    item_id = item["id"]
+                    label = item["label"]
+                    recipe = item["recipe"]
 
-    for fh in hours:
-        try:
-            # wrfsfc: CAPE + 10m wind
-            sfc_url = nomads_url_wrfsfc(init_stamp, fh, want_cape=True, want_10m=True)
-            sfc_bytes = http_get_bytes(sfc_url, timeout=(15, 120), retries=2)
-            ds_sfc = open_grib_bytes(sfc_bytes)
+                    # v1 only supports "field" right now (we’ll add CAPE/shear recipes next step)
+                    if recipe != "field":
+                        log(f"[HRRR] SKIP (recipe not implemented yet): {item_id} ({recipe})")
+                        continue
 
-            # CAPE variable name can vary; look for anything containing "CAPE"
-            cape_var = None
-            for v in ds_sfc.data_vars:
-                if "CAPE" in v.upper():
-                    cape_var = v
-                    break
-            if cape_var is None:
-                raise RuntimeError("CAPE var not found in wrfsfc subset")
+                    for fhr in fhrs:
+                        url = hrrr_url(run_dt, cyc, fhr, domain="conus")
+                        grib_local = os.path.join(tmp, f"hrrr_conus_{cyc:02d}_f{fhr:02d}.grib2")
 
-            cape = ds_sfc[cape_var].values.astype(np.float32)
+                        # Download GRIB2 (once per fhr; reuse across products by caching filename)
+                        if not os.path.exists(grib_local):
+                            log(f"[HRRR] Download f{fhr:02d}: {url}")
+                            http_get_stream(url, grib_local)
 
-            # 10m wind
-            u10 = None
-            v10 = None
-            for v in ds_sfc.data_vars:
-                up = v.upper()
-                if up.startswith("UGRD"):
-                    u10 = ds_sfc[v].values.astype(np.float32)
-                if up.startswith("VGRD"):
-                    v10 = ds_sfc[v].values.astype(np.float32)
-            if u10 is None or v10 is None:
-                raise RuntimeError("10m U/V not found in wrfsfc subset")
+                        da, lat, lon = run_recipe_field("hrrr", grib_local, item)
 
-            lat, lon = get_latlon(ds_sfc)
+                        plot_cfg = item.get("plot", {})
+                        units = plot_cfg.get("units", "")
+                        cmap = plot_cfg.get("cmap", "turbo")
+                        vmin, vmax = None, None
+                        if "range" in plot_cfg and isinstance(plot_cfg["range"], list) and len(plot_cfg["range"]) == 2:
+                            vmin, vmax = float(plot_cfg["range"][0]), float(plot_cfg["range"][1])
 
-            # wrfprs: 850mb wind
-            prs_url = nomads_url_wrfprs(init_stamp, fh)
-            prs_bytes = http_get_bytes(prs_url, timeout=(15, 120), retries=2)
-            ds_prs = open_grib_bytes(prs_bytes)
+                        title = f"HRRR CONUS {cyc:02d}Z • f{fhr:02d} • {label}"
+                        out_png = os.path.join(tmp, f"hrrr_conus_{item_id}_f{fhr:03d}.png")
 
-            u850 = None
-            v850 = None
-            for v in ds_prs.data_vars:
-                up = v.upper()
-                if up.startswith("UGRD"):
-                    u850 = ds_prs[v].values.astype(np.float32)
-                if up.startswith("VGRD"):
-                    v850 = ds_prs[v].values.astype(np.float32)
-            if u850 is None or v850 is None:
-                raise RuntimeError("850mb U/V not found in wrfprs subset")
+                        render_pcolormesh(
+                            out_png=out_png,
+                            da=da,
+                            lat=lat,
+                            lon=lon,
+                            title=title,
+                            units=units,
+                            cmap=cmap,
+                            vmin=vmin,
+                            vmax=vmax,
+                            model="hrrr",
+                            domain="conus",
+                        )
 
-            # shear magnitude in knots
-            shear = np.sqrt((u850 - u10) ** 2 + (v850 - v10) ** 2) * MS_TO_KT
+                        object_path = f"hrrr/conus/latest/{item_id}_f{fhr:03d}.png"
+                        if sb:
+                            upload_file(sb, SUPABASE_BUCKET, object_path, out_png)
+                            log(f"[HRRR] Uploaded: {object_path}")
+                        else:
+                            log(f"[HRRR] Rendered: {out_png}")
 
-            # render CAPE + shear
-            cape_png = save_field_png(
-                cape, lat, lon,
-                title=f"HRRR CONUS SBCAPE (J/kg)  init {init_stamp}  f{fh:02d}"
-            )
-            shear_png = save_field_png(
-                shear, lat, lon,
-                title=f"HRRR CONUS 0–850mb Bulk Shear (kt)  init {init_stamp}  f{fh:02d}"
-            )
+        # --- GFS
+        if "gfs" in registry["models"]:
+            run_dt, cyc = find_latest_gfs_cycle()
+            log(f"GFS latest cycle: {run_dt:%Y-%m-%d} {cyc:02d}Z")
 
-            cape_name = f"cape_f{fh:03d}.png"
-            shr_name = f"shr0_850_f{fh:03d}.png"
+            gfs_model = registry["models"]["gfs"]
+            domain_cfg = gfs_model["domains"]["global"]
 
-            supabase_upload_bytes(settings, f"{latest_prefix}/{cape_name}", cape_png, "image/png")
-            supabase_upload_bytes(settings, f"{run_prefix}/{cape_name}", cape_png, "image/png")
-            cape_ok.append(fh)
+            max_fhr = min(GFS_MAX_FHR, int(domain_cfg["fhr_range"]["end"]))
+            step = int(domain_cfg["fhr_range"]["step"])
+            fhrs = list(range(0, max_fhr + 1, step))
 
-            supabase_upload_bytes(settings, f"{latest_prefix}/{shr_name}", shear_png, "image/png")
-            supabase_upload_bytes(settings, f"{run_prefix}/{shr_name}", shear_png, "image/png")
-            shear_ok.append(fh)
+            for group_key, group in gfs_model["products"].items():
+                for item in group["items"]:
+                    item_id = item["id"]
+                    label = item["label"]
+                    recipe = item["recipe"]
 
-            time.sleep(0.25)
+                    if recipe != "field":
+                        log(f"[GFS] SKIP (recipe not implemented yet): {item_id} ({recipe})")
+                        continue
 
-        except Exception as e:
-            print(f"[cape/shear] fh{fh:03d} failed: {e}", file=sys.stderr)
+                    for fhr in fhrs:
+                        url = gfs_url(run_dt, cyc, fhr)
+                        grib_local = os.path.join(tmp, f"gfs_{cyc:02d}_f{fhr:03d}.grib2")
 
-    manifest["products"]["cape"] = {"ok_hours": cape_ok, "source": "NOMADS HRRR GRIB (wrfsfc)"}
-    manifest["products"]["shr0_850"] = {"ok_hours": shear_ok, "source": "NOMADS HRRR GRIB (wrfsfc+wrfprs)"}
+                        if not os.path.exists(grib_local):
+                            log(f"[GFS] Download f{fhr:03d}: {url}")
+                            http_get_stream(url, grib_local)
 
-    # ---- upload manifest
-    mbytes = json.dumps(manifest, indent=2).encode("utf-8")
-    supabase_upload_bytes(settings, f"{latest_prefix}/manifest.json", mbytes, "application/json")
-    supabase_upload_bytes(settings, f"{run_prefix}/manifest.json", mbytes, "application/json")
+                        da, lat, lon = run_recipe_field("gfs", grib_local, item)
 
-    print("Done ✅")
+                        title = f"GFS {cyc:02d}Z • f{fhr:03d} • {label}"
+                        out_png = os.path.join(tmp, f"gfs_global_{item_id}_f{fhr:03d}.png")
+
+                        plot_cfg = item.get("plot", {})
+                        kind = plot_cfg.get("kind", "pcolormesh")
+
+                        if item_id == "mslp" or kind == "contour":
+                            levels = plot_cfg.get("levels_hpa", [960, 968, 976, 984, 992, 1000, 1008, 1016, 1024, 1032, 1040])
+                            render_contours_mslp(
+                                out_png=out_png,
+                                da=da,
+                                lat=lat,
+                                lon=lon,
+                                title=title,
+                                levels_hpa=list(levels),
+                                model="gfs",
+                                domain="global",
+                            )
+                        else:
+                            units = plot_cfg.get("units", "")
+                            cmap = plot_cfg.get("cmap", "turbo")
+                            vmin, vmax = None, None
+                            if "range" in plot_cfg and isinstance(plot_cfg["range"], list) and len(plot_cfg["range"]) == 2:
+                                vmin, vmax = float(plot_cfg["range"][0]), float(plot_cfg["range"][1])
+
+                            render_pcolormesh(
+                                out_png=out_png,
+                                da=da,
+                                lat=lat,
+                                lon=lon,
+                                title=title,
+                                units=units,
+                                cmap=cmap,
+                                vmin=vmin,
+                                vmax=vmax,
+                                model="gfs",
+                                domain="global",
+                            )
+
+                        object_path = f"gfs/global/latest/{item_id}_f{fhr:03d}.png"
+                        if sb:
+                            upload_file(sb, SUPABASE_BUCKET, object_path, out_png)
+                            log(f"[GFS] Uploaded: {object_path}")
+                        else:
+                            log(f"[GFS] Rendered: {out_png}")
+
+        log("Done.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
